@@ -91,7 +91,7 @@ pip install git+https://github.com/huggingface/diffusers.git
 请确保项目根目录下有以下文件/文件夹：
 
 1.  **基础模型**：`./Z-Image-Model` (从 HuggingFace 下载的完整文件夹)
-2.  **LoRA 文件**：`./Technically_Color_Z_Image_Turbo_v1_renderartist_2000.safetensors`
+2.  **LoRA 文件**：`./Technically_Color_Z_Image_Turbo_v1_renderartist_2000.safetensors`（需要单独下载）
 
 *提示：可以在 `config.py` 中修改这些路径。*
 
