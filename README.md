@@ -108,7 +108,6 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ```
 python main.py
-
 ```
 
 等待终端显示： `🚀 Z-Image Studio 全栈版已启动! 👉 请访问: http://127.0.0.1:8888`

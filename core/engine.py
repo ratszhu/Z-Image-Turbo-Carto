@@ -2,7 +2,6 @@
 """
 推理引擎 (API适配版)
 负责模型的加载、显存优化及图片生成。
-返回结构化数据而非 UI 字符串。
 """
 import torch
 from diffusers import DiffusionPipeline # type: ignore
@@ -13,6 +12,7 @@ from core.lora_manager import LoRAMerger
 import config
 
 class ZImageEngine:
+    # ... (前面的 __init__, is_loaded, load_model 保持不变) ...
     def __init__(self):
         self.pipe = None
         self.device = None
@@ -24,7 +24,7 @@ class ZImageEngine:
         return self.pipe is not None
 
     def load_model(self):
-        """加载模型 (自动检测设备)"""
+        # ... (保持不变) ...
         self.device = detect_device()
         self.dtype = get_torch_dtype(self.device)
         
@@ -60,61 +60,71 @@ class ZImageEngine:
 
     def _apply_optimizations(self):
         """应用优化策略"""
-        # VAE 强制 FP32
+        # [关键修复] VAE 强制 FP32
+        # 无论是在 MPS 还是 CUDA 上，VAE 在 FP16/BF16 下都极易溢出导致黑图或模糊
+        # 因此，必须强制 VAE 运行在 float32 模式
         if hasattr(self.pipe, "vae"):
-            self.pipe.vae.to(dtype=torch.float32) # pyright: ignore[reportOptionalMemberAccess]
-            self.pipe.vae.config.force_upcast = True # pyright: ignore[reportOptionalMemberAccess]
+            self.pipe.vae.to(dtype=torch.float32) # type: ignore
+            # 某些版本的 diffusers 需要显式设置 force_upcast
+            if hasattr(self.pipe.vae.config, "force_upcast"): # type: ignore
+                self.pipe.vae.config.force_upcast = True # type: ignore
+            print("👁️ [Optim] VAE 已切换至 FP32 (防止黑图/模糊)")
 
         # 硬件特定优化
         if self.device == "mps":
             # MPS 显存足够时关闭 Tiling 以获得最佳画质
             pass 
         elif self.device == "cuda":
-            self.pipe.enable_model_cpu_offload() # pyright: ignore[reportOptionalMemberAccess]
+            # 12GB 显存用户必须开启 CPU Offload
+            # 这会将暂时不用的模型层移到内存，腾出显存给 VAE 解码
+            self.pipe.enable_model_cpu_offload() # type: ignore
+            
+            # [建议开启] VAE Tiling 也是防止 12G 显存解码爆显存/黑屏的关键
             if hasattr(self.pipe, "enable_vae_tiling"):
-                self.pipe.enable_vae_tiling() # pyright: ignore[reportOptionalMemberAccess]
+                self.pipe.enable_vae_tiling() # type: ignore
+                print("🧠 [Optim] CUDA: VAE Tiling 已开启 (节省显存)")
+            
+            print("🧠 [Optim] CUDA: CPU Offload 已开启")
 
+    # ... (后面的 update_lora 和 generate 保持不变) ...
     def update_lora(self, enable, scale):
-        """更新 LoRA 状态"""
         if not self.is_loaded(): return
-        
-        # 简化逻辑：状态变更则重载模型
         if (not enable and self.current_lora_applied) or (enable and self.current_lora_applied):
             print("🔄 [Engine] LoRA 变更，重载模型...")
             self.load_model()
             if enable:
-                self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # pyright: ignore[reportOptionalMemberAccess]
+                self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # type: ignore
                 self.current_lora_applied = True
         elif enable and not self.current_lora_applied:
-            self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # pyright: ignore[reportOptionalMemberAccess]
+            self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # type: ignore
             self.current_lora_applied = True
 
     def generate(self, prompt, neg_prompt, steps, cfg, width, height, seed, seed_mode):
-        """
-        生成图片
-        Returns:
-            dict: { "image": PIL_Image, "seed": int, "duration": float }
-        """
         start_time = time.time()
-        
-        # 显存清理
         gc.collect()
         if self.device == "mps": torch.mps.empty_cache()
         if self.device == "cuda": torch.cuda.empty_cache()
 
-        # 种子处理
         if seed_mode == "random" or seed == -1:
             actual_seed = torch.randint(0, 2**32 - 1, (1,)).item()
         else:
             actual_seed = int(seed)
             
         gen_device = "cpu" if self.device == "mps" else self.device
-        generator = torch.Generator(gen_device).manual_seed(actual_seed) # pyright: ignore[reportArgumentType]
+        generator = torch.Generator(gen_device).manual_seed(actual_seed) # type: ignore
 
         print(f"🎨 [Generate] 尺寸: {width}x{height} | 步数: {steps} | 种子: {actual_seed}")
 
         try:
-            image = self.pipe(prompt=prompt,negative_prompt=neg_prompt,num_inference_steps=steps,guidance_scale=cfg,width=width,height=height,generator=generator).images[0] # type: ignore
+            image = self.pipe(
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                width=width,
+                height=height,
+                generator=generator
+            ).images[0] # type: ignore
             
             duration = time.time() - start_time
             
