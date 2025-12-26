@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Z-Image Studio 全栈入口
+Z-Image Carto 全栈入口
 同时负责 API 服务和 静态页面托管。
 """
 import uvicorn
@@ -16,7 +16,7 @@ from database.db_manager import DatabaseManager
 import config
 
 # --- 1. 初始化 ---
-app = FastAPI(title="Z-Image Studio")
+app = FastAPI(title="Z-Image Carto")
 
 # 允许跨域 (保留作为保险)
 app.add_middleware(
@@ -133,6 +133,6 @@ app.mount("/outputs", StaticFiles(directory=config.OUTPUT_DIR), name="outputs")
 app.mount("/", StaticFiles(directory="web", html=True), name="web")
 
 if __name__ == "__main__":
-    print("🚀 Z-Image Studio 全栈版已启动!")
+    print("🚀 Z-Image Carto 全栈版已启动!")
     print("👉 请访问: http://127.0.0.1:8888")
     uvicorn.run("main:app", host="127.0.0.1", port=8888, reload=True)
