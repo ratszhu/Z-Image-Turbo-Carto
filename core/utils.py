@@ -33,7 +33,7 @@ def get_torch_dtype(device: str):
     """
     if device == "cuda":
         # NVIDIA 显卡: FP16 性能最佳且显存占用低
-        return torch.float16
+        return torch.bfloat16 #强制修改为 bfloat16 ，但不支持RTX 20系 (Turing), GTX 10系 (Pascal) 及更老架构的显卡
     elif device == "mps":
         # Apple Silicon: 必须使用 Bfloat16
         # 原因1: 避免 FP16 的溢出(黑屏)问题
