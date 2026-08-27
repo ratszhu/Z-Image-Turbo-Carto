@@ -1,106 +1,162 @@
-'''
-Descripttion: 
-Author: 朱东帅
-Date: 2025-12-08 13:45:44
-LastEditors: 朱东帅
-LastEditTime: 2025-12-08 14:01:12
-'''
 # -*- coding: utf-8 -*-
-"""
-LoRA 管理器
-专门处理 Z-Image 等非标准结构模型的 LoRA 权重注入。
-由于 Z-Image 包含特殊的 Refiner 层，普通的 load_lora_weights 无法生效，
-必须使用此类进行层对层的精准注入。
-"""
-import torch
-import safetensors.torch
-import re
-import os
+"""Z-Image LoRA adapter 管理。
 
-class LoRAMerger:
+LoRA 以 PEFT adapter 形式挂载到 Transformer，避免直接、不可逆地修改基础权重。
+这样开关和调整强度都不需要重新加载 6B 基础模型。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+import safetensors.torch
+
+
+@dataclass(frozen=True)
+class LoRAUpdateResult:
+    success: bool
+    message: str
+    matched_layers: int = 0
+
+
+class LoRAManager:
+    ADAPTER_NAME = "custom_lora"
+
     def __init__(self, pipeline):
         self.pipeline = pipeline
-        self.loaded_path = None
+        self.loaded_path: str | None = None
+        self.enabled = False
+        self.scale = 0.0
+        self.matched_layers = 0
 
-    def load_lora_weights(self, lora_path: str, lora_scale: float = 1.0):
-        """加载并合并 LoRA 权重"""
-        if not os.path.exists(lora_path):
-            print(f"⚠️ [LoRA Manager] 文件未找到: {lora_path}，跳过加载。")
+    def _delete_loaded_adapter(self) -> None:
+        """删除旧 adapter，保证切换 LoRA 时不叠加、不重名。"""
+        if not self.loaded_path:
             return
+        self.transformer.disable_adapters()
+        self.transformer.delete_adapters(self.ADAPTER_NAME)
+        self.loaded_path = None
+        self.enabled = False
+        self.scale = 0.0
+        self.matched_layers = 0
 
-        print(f"🎨 [LoRA Manager] 正在注入 LoRA: {os.path.basename(lora_path)} (强度: {lora_scale})...")
+    @property
+    def transformer(self):
+        transformer = getattr(self.pipeline, "transformer", None)
+        if transformer is None:
+            raise RuntimeError("当前 pipeline 不包含 transformer，无法加载 LoRA")
+        return transformer
+
+    @staticmethod
+    def _normalize_state_dict(state_dict):
+        """把训练文件的 diffusion_model.* 键转换成 Diffusers/PEFT 格式。"""
+        converted = {}
+        for key, value in state_dict.items():
+            if not (key.endswith(".lora_A.weight") or key.endswith(".lora_B.weight")):
+                continue
+            normalized = key.removeprefix("diffusion_model.")
+            converted[f"transformer.{normalized}"] = value
+        return converted
+
+    def _validate_targets(self, state_dict) -> int:
+        """在注入前确认 LoRA 指向的基础层真实存在。"""
+        matched = 0
+        transformer = self.transformer
+        for key in state_dict:
+            if not key.endswith(".lora_A.weight"):
+                continue
+            module_path = key.removeprefix("transformer.").removesuffix(".lora_A.weight")
+            try:
+                module = transformer.get_submodule(module_path)
+            except (AttributeError, KeyError):
+                continue
+            if hasattr(module, "weight"):
+                matched += 1
+        return matched
+
+    def load(self, lora_path: str, scale: float = 1.0) -> LoRAUpdateResult:
+        if not os.path.isfile(lora_path):
+            return LoRAUpdateResult(False, f"LoRA 文件未找到: {lora_path}")
+
         try:
-            tensors = safetensors.torch.load_file(lora_path)
-            self._merge_lora_weights(tensors, lora_scale)
+            import peft  # noqa: F401  # PEFT 是 Diffusers adapter 的运行时依赖
+            from diffusers.utils.peft_utils import set_weights_and_activate_adapters
+        except ImportError:
+            return LoRAUpdateResult(False, "缺少 PEFT 依赖，请执行 pip install -r requirements.txt")
+
+        try:
+            raw_state_dict = safetensors.torch.load_file(lora_path, device="cpu")
+            state_dict = self._normalize_state_dict(raw_state_dict)
+            del raw_state_dict
+
+            a_count = sum(key.endswith(".lora_A.weight") for key in state_dict)
+            b_count = sum(key.endswith(".lora_B.weight") for key in state_dict)
+            if a_count == 0 or a_count != b_count:
+                raise ValueError(f"LoRA A/B 权重不完整: A={a_count}, B={b_count}")
+
+            matched = self._validate_targets(state_dict)
+            if matched == 0:
+                raise ValueError("LoRA 未匹配到任何 Transformer 层")
+            if matched != a_count:
+                raise ValueError(f"LoRA 仅匹配 {matched}/{a_count} 层，已拒绝部分注入")
+
+            # 校验全部通过后才卸载旧 LoRA，避免一个无效文件影响当前状态。
+            if self.loaded_path:
+                self._delete_loaded_adapter()
+
+            self.transformer.load_lora_adapter(
+                state_dict,
+                prefix="transformer",
+                adapter_name=self.ADAPTER_NAME,
+                low_cpu_mem_usage=True,
+                _pipeline=self.pipeline,
+            )
+            set_weights_and_activate_adapters(
+                self.transformer,
+                [self.ADAPTER_NAME],
+                [float(scale)],
+            )
+            self.transformer.enable_adapters()
+
             self.loaded_path = lora_path
-        except Exception as e:
-            print(f"❌ [LoRA Manager] 注入失败: {e}")
+            self.enabled = True
+            self.scale = float(scale)
+            self.matched_layers = matched
+            return LoRAUpdateResult(True, f"LoRA 已加载，共匹配 {matched} 层", matched)
+        except Exception as exc:
+            return LoRAUpdateResult(False, f"LoRA 加载失败: {exc}")
 
-    def _get_module_from_path(self, module_path):
-        """工具函数：通过字符串路径获取模型中的层对象"""
+    def unload(self) -> LoRAUpdateResult:
         try:
-            parts = module_path.split('.')
-            current = self.pipeline
-            for part in parts:
-                if part.isdigit():
-                    current = current[int(part)]
-                else:
-                    current = getattr(current, part)
-            return current
-        except AttributeError:
-            return None
+            self._delete_loaded_adapter()
+            return LoRAUpdateResult(True, "LoRA 已卸载")
+        except Exception as exc:
+            return LoRAUpdateResult(False, f"LoRA 卸载失败: {exc}")
 
-    def _get_module_path_from_lora_key(self, lora_key):
-        """核心逻辑：将 LoRA 的键名映射到 Z-Image 模型的实际层路径"""
-        key = lora_key.replace('diffusion_model.', '')
-        
-        # 1. 匹配 Refiner 层 (这是 Z-Image 画质好的关键)
-        context_match = re.match(r'context_refiner\.(\d+)\.attention\.(to_q|to_k|to_v|to_out\.0)', key)
-        if context_match:
-            layer_idx, target = context_match.groups()
-            return f"transformer.context_refiner.{layer_idx}.attention.{target}"
+    def update(self, enable: bool, scale: float) -> LoRAUpdateResult:
+        if not self.loaded_path:
+            return LoRAUpdateResult(False, "LoRA 尚未加载")
 
-        noise_match = re.match(r'noise_refiner\.(\d+)\.attention\.(to_q|to_k|to_v|to_out\.0)', key)
-        if noise_match:
-            layer_idx, target = noise_match.groups()
-            return f"transformer.noise_refiner.{layer_idx}.attention.{target}"
+        try:
+            if enable:
+                from diffusers.utils.peft_utils import set_weights_and_activate_adapters
 
-        # 2. 匹配常规 Transformer 层
-        if key.startswith('layers.'):
-            return f"transformer.{key}"
-            
-        return None
+                set_weights_and_activate_adapters(
+                    self.transformer,
+                    [self.ADAPTER_NAME],
+                    [float(scale)],
+                )
+                self.transformer.enable_adapters()
+                self.enabled = True
+                self.scale = float(scale)
+                return LoRAUpdateResult(True, f"LoRA 已启用，强度 {self.scale}", self.matched_layers)
 
-    def _merge_lora_weights(self, lora_state_dict, lora_scale):
-        """执行权重合并：W_new = W_old + (B @ A) * scale"""
-        count = 0
-        device = self.pipeline.device
-        
-        for key in lora_state_dict.keys():
-            if ".lora_A.weight" in key:
-                base_key = key.replace(".lora_A.weight", "")
-                b_key = f"{base_key}.lora_B.weight"
-                alpha_key = f"{base_key}.alpha"
-                
-                module_path = self._get_module_path_from_lora_key(key)
-                if not module_path: continue
-                
-                module = self._get_module_from_path(module_path)
-                if module is None or not hasattr(module, 'weight'): continue
+            self.transformer.disable_adapters()
+            self.enabled = False
+            return LoRAUpdateResult(True, "LoRA 已停用", self.matched_layers)
+        except Exception as exc:
+            return LoRAUpdateResult(False, f"LoRA 状态更新失败: {exc}", self.matched_layers)
 
-                # 临时提升到 FP32 进行计算以保证精度
-                A = lora_state_dict[key].to(dtype=torch.float32, device=device)
-                B = lora_state_dict[b_key].to(dtype=torch.float32, device=device)
-                
-                rank = A.shape[0]
-                alpha = lora_state_dict[alpha_key].item() if alpha_key in lora_state_dict else rank
-                scale = lora_scale * (alpha / rank)
-                
-                # 计算增量并注入
-                delta = (B @ A) * scale
-                
-                with torch.no_grad():
-                    module.weight.data += delta.to(module.weight.dtype)
-                    count += 1
-                    
-        print(f"✅ [LoRA Manager] 注入完成，共修改 {count} 层权重。")
+
+# 保留旧名称，避免第三方代码导入后立即失败。
+LoRAMerger = LoRAManager

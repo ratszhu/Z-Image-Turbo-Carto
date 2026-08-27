@@ -34,11 +34,21 @@ class DatabaseManager:
                 height INTEGER,
                 lora_enabled INTEGER,
                 lora_scale REAL,
+                lora_id TEXT,
+                lora_name TEXT,
                 device TEXT,
                 duration REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 旧版数据库无损升级：保留全部历史记录。
+        existing_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(generations)").fetchall()
+        }
+        if "lora_id" not in existing_columns:
+            cursor.execute("ALTER TABLE generations ADD COLUMN lora_id TEXT")
+        if "lora_name" not in existing_columns:
+            cursor.execute("ALTER TABLE generations ADD COLUMN lora_name TEXT")
         conn.commit()
         conn.close()
 
@@ -56,8 +66,8 @@ class DatabaseManager:
         query = '''
             INSERT INTO generations (
                 filename, prompt, negative_prompt, steps, cfg, seed, 
-                width, height, lora_enabled, lora_scale, device, duration
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                width, height, lora_enabled, lora_scale, lora_id, lora_name, device, duration
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         '''
         
         values = (
@@ -71,6 +81,8 @@ class DatabaseManager:
             record_data.get('height'),
             1 if record_data.get('lora_enabled') else 0,
             record_data.get('lora_scale'),
+            record_data.get('lora_id'),
+            record_data.get('lora_name'),
             record_data.get('device'),
             record_data.get('duration')
         )

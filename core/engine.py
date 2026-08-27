@@ -1,141 +1,262 @@
 # -*- coding: utf-8 -*-
-"""
-推理引擎 (API适配版)
-负责模型的加载、显存优化及图片生成。
-"""
-import torch
-from diffusers import DiffusionPipeline # type: ignore
+"""Z-Image 推理引擎及其生命周期管理。"""
+from __future__ import annotations
+
 import gc
+import os
+import threading
 import time
-from core.utils import detect_device, get_torch_dtype
-from core.lora_manager import LoRAMerger
+from typing import Any
+
+import torch
+from diffusers import DiffusionPipeline
+
 import config
+from core.lora_manager import LoRAManager, LoRAUpdateResult
+from core.utils import detect_device, get_hardware_info, get_torch_dtype, is_mps_available
+
+
+class GenerationCancelled(Exception):
+    """用户主动停止本次采样。"""
+
 
 class ZImageEngine:
-    # ... (前面的 __init__, is_loaded, load_model 保持不变) ...
     def __init__(self):
         self.pipe = None
-        self.device = None
-        self.dtype = None
-        self.lora_merger = None
-        self.current_lora_applied = False
-
-    def is_loaded(self):
-        return self.pipe is not None
-
-    def load_model(self):
-        # ... (保持不变) ...
         self.device = detect_device()
         self.dtype = get_torch_dtype(self.device)
-        
-        print(f"🚀 [Engine] 正在加载模型... 设备: {self.device.upper()}, 精度: {self.dtype}")
-        
-        # 清理旧显存
-        if self.pipe:
-            del self.pipe
-            self.pipe = None
-            gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            if torch.backends.mps.is_available(): torch.mps.empty_cache()
+        self.hardware_info = get_hardware_info()
 
-        try:
-            self.pipe = DiffusionPipeline.from_pretrained(
-                config.MODEL_PATH,
-                torch_dtype=self.dtype,
-                trust_remote_code=True,
-            )
-            self.pipe.to(self.device)
-            
-            self.lora_merger = LoRAMerger(self.pipe)
-            self.current_lora_applied = False
-            
-            self._apply_optimizations()
-            
-            print("✅ [Engine] 模型加载完毕。")
-            return True, f"就绪 ({self.device.upper()})"
-            
-        except Exception as e:
-            print(f"❌ [Engine] 加载失败: {e}")
-            return False, str(e)
+        self.state = "idle"
+        self.status_message = "等待加载模型"
+        self.error: str | None = None
+        self.offload_mode = "none"
+        self.generation_active = False
+        self.cancel_event = threading.Event()
 
-    def _apply_optimizations(self):
-        """应用优化策略"""
-        # [关键修复] VAE 强制 FP32
-        # 无论是在 MPS 还是 CUDA 上，VAE 在 FP16/BF16 下都极易溢出导致黑图或模糊
-        # 因此，必须强制 VAE 运行在 float32 模式
-        if hasattr(self.pipe, "vae"):
-            self.pipe.vae.to(dtype=torch.float32) # type: ignore
-            # 某些版本的 diffusers 需要显式设置 force_upcast
-            if hasattr(self.pipe.vae.config, "force_upcast"): # type: ignore
-                self.pipe.vae.config.force_upcast = True # type: ignore
-            print("👁️ [Optim] VAE 已切换至 FP32 (防止黑图/模糊)")
+        self.lora_manager: LoRAManager | None = None
+        self.current_lora_applied = False
+        self.current_lora_scale: float | None = None
+        self.current_lora_path: str | None = None
+        self.lora_error: str | None = None
 
-        # 硬件特定优化
-        if self.device == "mps":
-            # MPS 显存足够时关闭 Tiling 以获得最佳画质
-            pass 
-        elif self.device == "cuda":
-            # 12GB 显存用户必须开启 CPU Offload
-            # 这会将暂时不用的模型层移到内存，腾出显存给 VAE 解码
-            self.pipe.enable_model_cpu_offload() # type: ignore
-            
-            # [建议开启] VAE Tiling 也是防止 12G 显存解码爆显存/黑屏的关键
-            if hasattr(self.pipe, "enable_vae_tiling"):
-                self.pipe.enable_vae_tiling() # type: ignore
-                print("🧠 [Optim] CUDA: VAE Tiling 已开启 (节省显存)")
-            
-            print("🧠 [Optim] CUDA: CPU Offload 已开启")
+        # update_lora + generate 必须作为一个原子操作执行，避免多请求修改同一模型。
+        self.inference_lock = threading.RLock()
 
-    # ... (后面的 update_lora 和 generate 保持不变) ...
-    def update_lora(self, enable, scale):
-        if not self.is_loaded(): return
-        if (not enable and self.current_lora_applied) or (enable and self.current_lora_applied):
-            print("🔄 [Engine] LoRA 变更，重载模型...")
-            self.load_model()
-            if enable:
-                self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # type: ignore
-                self.current_lora_applied = True
-        elif enable and not self.current_lora_applied:
-            self.lora_merger.load_lora_weights(config.LORA_PATH, scale) # type: ignore
-            self.current_lora_applied = True
+    def is_loaded(self) -> bool:
+        return self.state == "ready" and self.pipe is not None
 
-    def generate(self, prompt, neg_prompt, steps, cfg, width, height, seed, seed_mode):
-        start_time = time.time()
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "loaded": self.is_loaded(),
+            "state": self.state,
+            "message": self.status_message,
+            "error": self.error,
+            "device": self.device,
+            "dtype": str(self.dtype),
+            "offload_mode": self.offload_mode,
+            "busy": self.generation_active,
+            "cancelling": self.generation_active and self.cancel_event.is_set(),
+            "lora_enabled": self.current_lora_applied,
+            "lora_scale": self.current_lora_scale,
+            "lora_id": os.path.basename(self.current_lora_path).split("--", 1)[0] if self.current_lora_path else None,
+            "lora_error": self.lora_error,
+            "hardware": self.hardware_info,
+        }
+
+    @staticmethod
+    def _clear_device_cache() -> None:
         gc.collect()
-        if self.device == "mps": torch.mps.empty_cache()
-        if self.device == "cuda": torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if is_mps_available():
+            torch.mps.empty_cache()
 
-        if seed_mode == "random" or seed == -1:
-            actual_seed = torch.randint(0, 2**32 - 1, (1,)).item()
+    def _select_cuda_offload_mode(self) -> str:
+        configured = config.CUDA_OFFLOAD_MODE
+        allowed = {"auto", "model", "sequential", "none"}
+        if configured not in allowed:
+            raise ValueError(f"无效的 ZIMAGE_CUDA_OFFLOAD={configured}，可选值: {sorted(allowed)}")
+        if configured != "auto":
+            return configured
+
+        vram_gb = float(self.hardware_info.get("vram_gb") or 0)
+        return "sequential" if vram_gb < 16 else "model"
+
+    def _prepare_pipeline_device(self, pipe) -> str:
+        """在不制造整模型 GPU 峰值的前提下设置运行设备。"""
+        if self.device == "mps":
+            pipe.to("mps")
+            return "none"
+        if self.device == "cpu":
+            pipe.to("cpu")
+            return "none"
+
+        mode = self._select_cuda_offload_mode()
+        if mode == "none":
+            pipe.to("cuda")
+        elif mode == "model":
+            pipe.enable_model_cpu_offload(device="cuda")
         else:
-            actual_seed = int(seed)
-            
-        gen_device = "cpu" if self.device == "mps" else self.device
-        generator = torch.Generator(gen_device).manual_seed(actual_seed) # type: ignore
+            pipe.enable_sequential_cpu_offload(device="cuda")
+        if hasattr(pipe, "enable_vae_tiling"):
+            pipe.enable_vae_tiling()
+        return mode
+
+    @staticmethod
+    def _prepare_vae(pipe) -> None:
+        vae = getattr(pipe, "vae", None)
+        if vae is None:
+            return
+        # 在 pipeline 仍位于 CPU 时转换，避免显存已满后再把 VAE 扩成 FP32。
+        vae.to(dtype=torch.float32)
+        if hasattr(vae.config, "force_upcast"):
+            vae.config.force_upcast = True
+
+    def load_model(self) -> tuple[bool, str]:
+        with self.inference_lock:
+            self.state = "loading"
+            self.status_message = "正在读取模型权重"
+            self.error = None
+            self.lora_error = None
+            self.current_lora_applied = False
+            self.current_lora_scale = None
+            self.current_lora_path = None
+            self.offload_mode = "none"
+            local_pipe = None
+
+            try:
+                self.device = detect_device()
+                self.dtype = get_torch_dtype(self.device)
+                self.hardware_info = get_hardware_info()
+                print(f"🚀 [Engine] 正在加载模型... 设备: {self.device.upper()}, 精度: {self.dtype}")
+
+                local_pipe = DiffusionPipeline.from_pretrained(
+                    config.MODEL_PATH,
+                    # 兼容仓库现有的 0.36.0.dev0；新版 Diffusers 仍保留该别名。
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                )
+                self.status_message = "正在配置 VAE 与 LoRA"
+                self._prepare_vae(local_pipe)
+
+                local_lora_manager = LoRAManager(local_pipe)
+                self.status_message = "正在配置显存策略"
+                offload_mode = self._prepare_pipeline_device(local_pipe)
+
+                # 只有所有关键步骤成功后，才发布新的 pipeline。
+                previous_pipe = self.pipe
+                self.pipe = local_pipe
+                self.lora_manager = local_lora_manager
+                self.offload_mode = offload_mode
+                self.current_lora_applied = local_lora_manager.enabled
+                self.current_lora_scale = local_lora_manager.scale if local_lora_manager.enabled else None
+                self.current_lora_path = local_lora_manager.loaded_path
+                self.state = "ready"
+                self.status_message = f"模型就绪 ({self.device.upper()})"
+                local_pipe = None
+
+                if previous_pipe is not None:
+                    del previous_pipe
+                    self._clear_device_cache()
+
+                print(f"✅ [Engine] 模型加载完毕，offload={self.offload_mode}")
+                return True, self.status_message
+            except Exception as exc:
+                self.pipe = None
+                self.lora_manager = None
+                self.state = "error"
+                self.error = str(exc)
+                self.status_message = "模型加载失败"
+                if local_pipe is not None:
+                    del local_pipe
+                self._clear_device_cache()
+                print(f"❌ [Engine] 加载失败: {exc}")
+                return False, str(exc)
+
+    def update_lora(self, enable: bool, scale: float, lora_path: str | None = None) -> LoRAUpdateResult:
+        if not self.is_loaded() or self.lora_manager is None:
+            return LoRAUpdateResult(False, "模型尚未就绪")
+
+        if enable and not lora_path:
+            return LoRAUpdateResult(False, "请先选择一个自定义 LoRA")
+
+        if enable and os.path.realpath(lora_path) != os.path.realpath(self.lora_manager.loaded_path or ""):
+            result = self.lora_manager.load(lora_path, scale)
+        else:
+            result = self.lora_manager.update(enable, scale)
+
+        if result.success:
+            self.current_lora_applied = self.lora_manager.enabled
+            self.current_lora_scale = self.lora_manager.scale if self.lora_manager.enabled else None
+            self.current_lora_path = self.lora_manager.loaded_path
+            self.lora_error = None
+        else:
+            self.lora_error = result.message
+        return result
+
+    def generate(
+        self,
+        prompt: str,
+        neg_prompt: str,
+        steps: int,
+        cfg: float,
+        width: int,
+        height: int,
+        seed: int,
+        seed_mode: str,
+    ) -> dict[str, Any]:
+        if not self.is_loaded():
+            return {"success": False, "error": self.error or "模型尚未就绪"}
+
+        start_time = time.time()
+        actual_seed = (
+            torch.randint(0, 2**32 - 1, (1,)).item()
+            if seed_mode == "random" or seed == -1
+            else int(seed)
+        )
+        generator_device = "cpu" if self.device == "mps" else self.device
+        generator = torch.Generator(generator_device).manual_seed(actual_seed)
 
         print(f"🎨 [Generate] 尺寸: {width}x{height} | 步数: {steps} | 种子: {actual_seed}")
+        self.cancel_event.clear()
+        self.generation_active = True
+
+        def check_cancellation(_pipeline, _step_index, _timestep, callback_kwargs):
+            if self.cancel_event.is_set():
+                raise GenerationCancelled("生成已停止")
+            return callback_kwargs
 
         try:
-            image = self.pipe(
-                prompt=prompt,
-                negative_prompt=neg_prompt,
-                num_inference_steps=steps,
-                guidance_scale=cfg,
-                width=width,
-                height=height,
-                generator=generator
-            ).images[0] # type: ignore
-            
-            duration = time.time() - start_time
-            
+            with torch.inference_mode():
+                image = self.pipe(
+                    prompt=prompt,
+                    negative_prompt=neg_prompt,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg,
+                    width=width,
+                    height=height,
+                    generator=generator,
+                    callback_on_step_end=check_cancellation,
+                ).images[0]
             return {
                 "success": True,
                 "image": image,
                 "seed": actual_seed,
-                "duration": round(duration, 2)
+                "duration": round(time.time() - start_time, 2),
             }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+        except GenerationCancelled:
+            return {"success": False, "cancelled": True, "error": "生成已停止"}
+        except Exception as exc:
+            self._clear_device_cache()
+            return {"success": False, "error": str(exc)}
+        finally:
+            self.generation_active = False
+            self.cancel_event.clear()
+
+    def request_stop(self) -> bool:
+        """请求在当前扩散步结束后中断，不等待推理锁。"""
+        if not self.generation_active:
+            return False
+        self.cancel_event.set()
+        return True

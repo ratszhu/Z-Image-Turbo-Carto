@@ -6,6 +6,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Z-Image Carto</title>
 
+  <!-- WebUI 必须由 FastAPI 提供；防止双击 HTML 后把 /api/* 错当成 file:// 请求。 -->
+  <script>
+    if (window.location.protocol === 'file:') {
+      window.location.replace('http://127.0.0.1:8888/');
+    }
+  </script>
+
   <!-- 1. 引入核心库 (更换为 jsDelivr CDN，更稳定) -->
   <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
@@ -99,12 +106,14 @@
       <div class="flex items-center gap-4 text-xs font-mono text-zinc-400">
         <div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-950 border border-zinc-800">
           <div class="flex items-center gap-1.5">
-            <span :class="status.loaded ? 'bg-emerald-500' : 'bg-red-500'"
+            <span :class="status.loaded ? 'bg-emerald-500' : (status.state === 'loading' ? 'bg-amber-500' : 'bg-red-500')"
                   class="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(16,185,129,0.4)]"></span>
-            <span class="font-medium text-zinc-300">{{ status.device || 'Connecting...' }}</span>
+            <span class="font-medium text-zinc-300" :title="status.error || status.message">{{ status.state === 'loading' ? 'LOADING' : (status.device || 'Connecting...') }}</span>
           </div>
           <span v-if="status.dtype" class="text-zinc-700">|</span>
           <span v-if="status.dtype" class="text-zinc-500">{{ status.dtype }}</span>
+          <span v-if="status.error" class="max-w-80 truncate text-red-400" :title="status.error">{{ status.error }}</span>
+          <span v-else-if="status.lora_error" class="max-w-80 truncate text-amber-400" :title="status.lora_error">LoRA 未启用</span>
         </div>
       </div>
     </header>
@@ -198,6 +207,7 @@
             <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
               <i data-lucide="shield-alert" class="w-3.5 h-3.5"></i> 负面提示词
             </label>
+            <div v-if="params.cfg <= 1" class="text-[10px] text-amber-500/80">CFG ≤ 1 时模型不会使用负面提示词</div>
             <textarea v-model="params.negative_prompt" rows="2"
                       class="w-full bg-zinc-950 border border-zinc-700/50 rounded-xl p-3 text-sm focus:border-zinc-500 outline-none transition resize-none placeholder-zinc-700 text-zinc-400 shadow-inner"></textarea>
           </div>
@@ -213,28 +223,34 @@
 
               <!-- 比例预设 -->
               <div class="grid grid-cols-4 gap-2 mb-3">
-                <button @click="setSize(1024, 1024)"
-                        class="py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 rounded border border-zinc-700 hover:border-zinc-600 transition-colors text-zinc-400 hover:text-zinc-200">1:1</button>
-                <button @click="setSize(832, 1216)"
-                        class="py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 rounded border border-zinc-700 hover:border-zinc-600 transition-colors text-zinc-400 hover:text-zinc-200">2:3</button>
-                <button @click="setSize(1216, 832)"
-                        class="py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 rounded border border-zinc-700 hover:border-zinc-600 transition-colors text-zinc-400 hover:text-zinc-200">3:2</button>
-                <button @click="setSize(768, 1344)"
-                        class="py-1.5 text-xs bg-zinc-800 hover:bg-zinc-700 rounded border border-zinc-700 hover:border-zinc-600 transition-colors text-zinc-400 hover:text-zinc-200">9:16</button>
+                <button v-for="preset in aspectPresets" :key="preset.label" @click="setSize(preset.width, preset.height)"
+                        :class="isRatioSelected(preset) ? 'bg-brand-600/20 border-brand-500 text-brand-300 ring-1 ring-brand-500/30' : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700 hover:border-zinc-600 hover:text-zinc-200'"
+                        class="py-1.5 text-xs rounded border transition-all">{{ preset.label }}</button>
               </div>
 
-              <div class="grid grid-cols-2 gap-4">
-                <div>
+              <div class="grid grid-cols-2 gap-3">
+                <label class="space-y-1.5">
+                  <div class="relative">
+                    <input type="number" v-model.number="params.width" @blur="normalizeDimension('width', $event)" @keyup.enter="normalizeDimension('width', $event)"
+                           min="512" max="2048" step="64"
+                           class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 pr-8 text-sm font-mono outline-none focus:border-brand-500">
+                    <span class="absolute right-3 top-2.5 text-[10px] text-zinc-600">W</span>
+                  </div>
                   <input type="range" v-model.number="params.width" min="512" max="2048" step="64"
-                         class="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-zinc-500 mb-2">
-                  <div class="text-[10px] text-zinc-500 text-center">宽度 (W)</div>
-                </div>
-                <div>
+                         class="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-brand-500">
+                </label>
+                <label class="space-y-1.5">
+                  <div class="relative">
+                    <input type="number" v-model.number="params.height" @blur="normalizeDimension('height', $event)" @keyup.enter="normalizeDimension('height', $event)"
+                           min="512" max="2048" step="64"
+                           class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 pr-8 text-sm font-mono outline-none focus:border-brand-500">
+                    <span class="absolute right-3 top-2.5 text-[10px] text-zinc-600">H</span>
+                  </div>
                   <input type="range" v-model.number="params.height" min="512" max="2048" step="64"
-                         class="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-zinc-500 mb-2">
-                  <div class="text-[10px] text-zinc-500 text-center">高度 (H)</div>
-                </div>
+                         class="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-brand-500">
+                </label>
               </div>
+              <p class="text-[10px] text-zinc-600">可直接输入 512–2048，数值会自动对齐到 64 像素。</p>
             </div>
 
             <!-- 步数 & CFG -->
@@ -275,25 +291,52 @@
               </div>
             </div>
 
-            <!-- LoRA 设置 -->
+            <!-- 自定义 LoRA（原内置“风格增强”已隐藏） -->
             <div class="space-y-3 pt-4 border-t border-zinc-800/50">
               <div class="flex items-center justify-between">
                 <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-                  <i data-lucide="wand-2" class="w-3.5 h-3.5 text-purple-400"></i> 风格增强 (LoRA)
+                  <i data-lucide="layers-3" class="w-3.5 h-3.5 text-purple-400"></i> 自定义 LoRA
                 </label>
-                <label class="relative inline-flex items-center cursor-pointer">
-                  <input type="checkbox" v-model="params.lora_enabled" class="sr-only peer">
+                <label class="relative inline-flex items-center cursor-pointer" :class="!params.lora_id && 'opacity-40 cursor-not-allowed'">
+                  <input type="checkbox" v-model="params.lora_enabled" :disabled="!params.lora_id" class="sr-only peer">
                   <div
                        class="w-9 h-5 bg-zinc-800 border border-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-400 after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600 peer-checked:after:bg-white peer-checked:border-purple-600">
                   </div>
                 </label>
               </div>
-              <div v-if="params.lora_enabled" class="space-y-1 bg-zinc-900/50 p-3 rounded-lg border border-zinc-800">
-                <div class="flex justify-between text-xs text-zinc-500">
-                  <span>强度</span>
-                  <span>{{ params.lora_scale }}</span>
+
+              <div class="space-y-2 bg-zinc-900/50 p-3 rounded-lg border border-zinc-800">
+                <div class="flex gap-2">
+                  <select v-model="params.lora_id" @change="params.lora_enabled = Boolean(params.lora_id)"
+                          class="min-w-0 flex-1 bg-zinc-950 border border-zinc-700 rounded-lg px-2.5 py-2 text-xs outline-none focus:border-purple-500">
+                    <option value="">不使用 LoRA</option>
+                    <option v-for="item in loras" :key="item.id" :value="item.id">{{ item.name }}</option>
+                  </select>
+                  <input ref="loraFileInput" type="file" accept=".safetensors" class="hidden" @change="uploadLora">
+                  <button @click="$refs.loraFileInput.click()" :disabled="isUploadingLora"
+                          class="px-3 rounded-lg border border-zinc-700 bg-zinc-800 hover:border-purple-500 hover:text-purple-300 disabled:opacity-50 transition"
+                          title="导入本地 .safetensors">
+                    <i :data-lucide="isUploadingLora ? 'loader-2' : 'plus'" :class="isUploadingLora && 'animate-spin'" class="w-4 h-4"></i>
+                  </button>
+                  <button v-if="params.lora_id" @click="deleteSelectedLora"
+                          class="px-3 rounded-lg border border-zinc-700 bg-zinc-800 hover:border-red-500 hover:text-red-400 transition"
+                          title="删除所选 LoRA">
+                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                  </button>
                 </div>
-                <input type="range" v-model.number="params.lora_scale" min="0" max="2" step="0.1"
+                <p class="text-[11px] leading-4 text-zinc-600">支持基于 Z-Image 训练的 Diffusers/PEFT `.safetensors`；SDXL、Flux 等其他底模 LoRA 不兼容。</p>
+              </div>
+
+              <div v-if="params.lora_enabled && params.lora_id" class="space-y-1 bg-zinc-900/50 p-3 rounded-lg border border-zinc-800">
+                <div class="flex justify-between items-center text-xs text-zinc-500">
+                  <span>权重</span>
+                  <div class="relative w-20">
+                    <input type="number" v-model.number="loraPercent" min="0" max="200" step="1"
+                           class="w-full bg-zinc-950 border border-zinc-700 rounded px-2 py-1 pr-6 text-right font-mono text-zinc-300 outline-none focus:border-purple-500">
+                    <span class="absolute right-2 top-1 text-zinc-600">%</span>
+                  </div>
+                </div>
+                <input type="range" v-model.number="loraPercent" min="0" max="200" step="1"
                        class="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-purple-500">
               </div>
             </div>
@@ -302,21 +345,16 @@
 
         <!-- 生成按钮 -->
         <div class="p-5 border-t border-zinc-800 bg-zinc-900/80 backdrop-blur-md">
-          <button @click="generateImage" :disabled="isGenerating"
+          <button v-if="!isGenerating" @click="generateImage" :disabled="!status.loaded"
                   class="w-full h-12 bg-gradient-to-r from-brand-600 to-purple-600 hover:from-brand-500 hover:to-purple-500 disabled:from-zinc-800 disabled:to-zinc-800 disabled:cursor-not-allowed text-white font-bold rounded-xl transition-all shadow-lg shadow-brand-900/20 flex items-center justify-center gap-2 group relative overflow-hidden border border-white/5">
-
-            <!-- 正常态 -->
-            <span v-if="!isGenerating" class="flex items-center gap-2 tracking-wide">
+            <span class="flex items-center gap-2 tracking-wide">
               <i data-lucide="sparkles" class="w-5 h-5 group-hover:scale-110 transition-transform"></i> 生成
             </span>
-
-            <!-- 生成中态 -->
-            <span v-else class="flex items-center gap-2">
-              <i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> 生成中...
-            </span>
-
-            <!-- 进度条背景 -->
-            <div v-if="isGenerating" class="absolute bottom-0 left-0 h-1 bg-white/30 animate-progress w-full"></div>
+          </button>
+          <button v-else @click="stopGeneration" :disabled="stopRequested"
+                  class="w-full h-12 bg-red-600/90 hover:bg-red-500 disabled:bg-zinc-800 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2 border border-red-400/20 disabled:border-zinc-700">
+            <i :data-lucide="stopRequested ? 'loader-2' : 'square'" :class="stopRequested && 'animate-spin'" class="w-5 h-5"></i>
+            {{ stopRequested ? '正在停止...' : '停止生成' }}
           </button>
         </div>
       </aside>
@@ -504,13 +542,14 @@
 
   <!-- Vue 逻辑 -->
   <script>
-    const { createApp, ref, onMounted, nextTick, onUpdated } = Vue;
+    const { createApp, ref, computed, onMounted, onUnmounted, nextTick, onUpdated } = Vue;
 
     createApp({
       setup() {
         // 状态
         const status = ref({ loaded: false, device: '', dtype: '' });
         const isGenerating = ref(false);
+        const stopRequested = ref(false);
         const generationTimer = ref(0);
         const currentImage = ref(null); // 当前显示的大图
         const history = ref([]);
@@ -518,6 +557,8 @@
         const lightboxImage = ref(null);
         const lightboxInfoShow = ref(false); // 默认隐藏信息
         const copiedField = ref(null);
+        const loras = ref([]);
+        const isUploadingLora = ref(false);
 
         // [新增] 分页相关状态
         const historyOffset = ref(0);
@@ -534,8 +575,24 @@
           height: 1024,
           seed: -1,
           seed_mode: 'fixed',
-          lora_enabled: true,
-          lora_scale: 1.3
+          lora_enabled: false,
+          lora_scale: 1.0,
+          lora_id: ''
+        });
+
+        const aspectPresets = [
+          { label: '1:1', width: 1024, height: 1024, ratio: 1 },
+          { label: '2:3', width: 832, height: 1216, ratio: 2 / 3 },
+          { label: '3:2', width: 1216, height: 832, ratio: 3 / 2 },
+          { label: '9:16', width: 768, height: 1344, ratio: 9 / 16 }
+        ];
+
+        const loraPercent = computed({
+          get: () => Math.round((Number(params.value.lora_scale) || 0) * 100),
+          set: (value) => {
+            const percent = Math.min(200, Math.max(0, Number(value) || 0));
+            params.value.lora_scale = Math.round(percent) / 100;
+          }
         });
 
         const API_BASE = "";
@@ -612,6 +669,66 @@
           }
         };
 
+        const errorMessage = async (res) => {
+          try {
+            const data = await res.json();
+            return data.detail || JSON.stringify(data);
+          } catch (_) {
+            return await res.text();
+          }
+        };
+
+        const fetchLoras = async () => {
+          try {
+            const res = await fetch(`${API_BASE}/api/loras`);
+            if (!res.ok) throw new Error(await errorMessage(res));
+            loras.value = await res.json();
+            if (params.value.lora_id && !loras.value.some(item => item.id === params.value.lora_id)) {
+              params.value.lora_id = '';
+              params.value.lora_enabled = false;
+            }
+          } catch (e) {
+            console.error("无法读取 LoRA 列表", e);
+          }
+        };
+
+        const uploadLora = async (event) => {
+          const input = event.target;
+          const file = input.files && input.files[0];
+          if (!file) return;
+          isUploadingLora.value = true;
+          try {
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch(`${API_BASE}/api/loras`, { method: 'POST', body: form });
+            if (!res.ok) throw new Error(await errorMessage(res));
+            const item = await res.json();
+            await fetchLoras();
+            params.value.lora_id = item.id;
+            params.value.lora_enabled = true;
+          } catch (e) {
+            alert("LoRA 导入失败: " + e.message);
+          } finally {
+            input.value = '';
+            isUploadingLora.value = false;
+          }
+        };
+
+        const deleteSelectedLora = async () => {
+          const item = loras.value.find(item => item.id === params.value.lora_id);
+          if (!item || !confirm(`确定删除 LoRA“${item.name}”吗？`)) return;
+          try {
+            const res = await fetch(`${API_BASE}/api/loras/${item.id}`, { method: 'DELETE' });
+            if (!res.ok) throw new Error(await errorMessage(res));
+            params.value.lora_id = '';
+            params.value.lora_enabled = false;
+            await fetchLoras();
+            await fetchStatus();
+          } catch (e) {
+            alert("删除 LoRA 失败: " + e.message);
+          }
+        };
+
         // [修改] 获取历史记录 (支持分页)
         const fetchHistory = async (reset = false) => {
           if (reset) {
@@ -632,7 +749,7 @@
 
             const processedHistory = await Promise.all(data.map(async (item) => {
               const url = `${API_BASE}${item.url}`;
-              const fileSize = await fetchImageSize(url);
+              const fileSize = item.file_size == null ? null : formatFileSize(item.file_size);
               let title = '无标题';
               if (item.prompt) {
                 title = item.prompt.slice(0, 10);
@@ -667,9 +784,14 @@
         const generateImage = async () => {
           if (isGenerating.value) return;
 
+          normalizeDimension('width');
+          normalizeDimension('height');
+
           // 1. 开始生成：清空当前图片，进入 Loading 状态
+          const previousImage = currentImage.value;
           currentImage.value = null;
           isGenerating.value = true;
+          stopRequested.value = false;
           generationTimer.value = 0;
           const timer = setInterval(() => generationTimer.value += 0.1, 100);
 
@@ -683,7 +805,7 @@
               body: JSON.stringify(payload)
             });
 
-            if (!res.ok) throw new Error(await res.text());
+            if (!res.ok) throw new Error(await errorMessage(res));
 
             const data = await res.json();
 
@@ -691,6 +813,7 @@
             const fileSize = await fetchImageSize(url);
 
             const newImage = {
+              id: data.id,
               url: url,
               meta: data.meta,
               duration: data.duration,
@@ -709,10 +832,29 @@
             fetchHistory(true);
 
           } catch (e) {
-            alert("生成失败: " + e.message);
+            if (stopRequested.value) {
+              currentImage.value = previousImage;
+            } else {
+              alert("生成失败: " + e.message);
+            }
           } finally {
             clearInterval(timer);
             isGenerating.value = false;
+            stopRequested.value = false;
+          }
+        };
+
+        const stopGeneration = async () => {
+          if (!isGenerating.value || stopRequested.value) return;
+          stopRequested.value = true;
+          try {
+            const res = await fetch(`${API_BASE}/api/generate/stop`, { method: 'POST' });
+            if (!res.ok) throw new Error(await errorMessage(res));
+            const data = await res.json();
+            if (!data.accepted) stopRequested.value = false;
+          } catch (e) {
+            stopRequested.value = false;
+            alert("停止失败: " + e.message);
           }
         };
 
@@ -725,8 +867,9 @@
           params.value.height = meta.height;
           params.value.seed = meta.seed;
           params.value.seed_mode = 'fixed';
-          params.value.lora_enabled = Boolean(meta.lora_enabled);
-          params.value.lora_scale = meta.lora_scale;
+          params.value.lora_id = meta.lora_id || '';
+          params.value.lora_enabled = Boolean(meta.lora_enabled && meta.lora_id);
+          params.value.lora_scale = meta.lora_scale || 1.0;
         };
 
         const selectHistoryItem = (item) => {
@@ -736,7 +879,8 @@
         const deleteHistoryItem = async (id) => {
           if (!confirm("确定删除这张图片吗？")) return;
           try {
-            await fetch(`${API_BASE}/api/history/${id}`, { method: 'DELETE' });
+            const res = await fetch(`${API_BASE}/api/history/${id}`, { method: 'DELETE' });
+            if (!res.ok) throw new Error(await res.text());
             history.value = history.value.filter(i => i.id !== id);
             if (currentImage.value && currentImage.value.id === id) {
               currentImage.value = null;
@@ -755,10 +899,29 @@
           params.value.height = h;
         };
 
+        const normalizeDimension = (field, event = null) => {
+          const raw = Number(params.value[field]) || 512;
+          const aligned = Math.min(2048, Math.max(512, Math.round(raw / 64) * 64));
+          params.value[field] = aligned;
+          if (event && event.target) event.target.value = aligned;
+        };
+
+        const isRatioSelected = (preset) => {
+          const ratio = params.value.width / params.value.height;
+          return Math.abs(ratio - preset.ratio) < 0.045;
+        };
+
+        let statusTimer = null;
         onMounted(() => {
           fetchStatus();
+          fetchLoras();
+          statusTimer = setInterval(fetchStatus, 2000);
           fetchHistory(true); // 初始加载
           renderIcons();
+        });
+
+        onUnmounted(() => {
+          if (statusTimer) clearInterval(statusTimer);
         });
 
         onUpdated(() => {
@@ -766,10 +929,13 @@
         });
 
         return {
-          status, params, isGenerating, generationTimer,
+          status, params, isGenerating, stopRequested, generationTimer, loras, isUploadingLora,
+          aspectPresets, loraPercent,
           currentImage, history, lightboxOpen, lightboxImage, lightboxInfoShow,
-          generateImage, setSize, fetchHistory, loadMoreHistory, hasMoreHistory, // 导出新方法和状态
-          selectHistoryItem, deleteHistoryItem, openLightbox, reuseParams, formatDate, copyText, copiedField
+          generateImage, stopGeneration, setSize, normalizeDimension, isRatioSelected,
+          fetchHistory, loadMoreHistory, hasMoreHistory, // 导出新方法和状态
+          selectHistoryItem, deleteHistoryItem, openLightbox, reuseParams, formatDate, copyText, copiedField,
+          fetchLoras, uploadLora, deleteSelectedLora
         };
       }
     }).mount('#app');

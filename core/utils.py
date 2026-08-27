@@ -4,7 +4,14 @@
 包含硬件设备检测、精度选择等通用辅助函数。
 """
 import torch
-import platform
+from typing import Any
+
+
+def is_mps_available() -> bool:
+    """Windows/Linux 的 PyTorch 构建不保证暴露 MPS 后端。"""
+    mps_backend = getattr(torch.backends, "mps", None)
+    return bool(mps_backend is not None and mps_backend.is_available())
+
 
 def detect_device():
     """
@@ -16,7 +23,7 @@ def detect_device():
     """
     if torch.cuda.is_available():
         return "cuda"
-    elif torch.backends.mps.is_available():
+    elif is_mps_available():
         return "mps"
     else:
         return "cpu"
@@ -32,13 +39,40 @@ def get_torch_dtype(device: str):
         torch.dtype: 推荐的张量数据类型
     """
     if device == "cuda":
-        # NVIDIA 显卡: FP16 性能最佳且显存占用低
-        return torch.bfloat16 #强制修改为 bfloat16 ，但不支持RTX 20系 (Turing), GTX 10系 (Pascal) 及更老架构的显卡
+        # BF16 可以解决部分新显卡上的 FP16 黑图，但旧架构并不支持。
+        # 必须按运行时能力判断，不能按显卡名称或系列硬编码。
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     elif device == "mps":
-        # Apple Silicon: 必须使用 Bfloat16
-        # 原因1: 避免 FP16 的溢出(黑屏)问题
-        # 原因2: 相比 FP32 节省一半显存，速度翻倍
+        # Apple Silicon 使用 BF16，VAE 在引擎中单独保持 FP32。
         return torch.bfloat16
     else:
         # CPU: 兜底使用 FP32，兼容性最好
         return torch.float32
+
+
+def get_hardware_info() -> dict[str, Any]:
+    """返回可直接暴露给状态接口的硬件诊断信息。"""
+    device = detect_device()
+    info: dict[str, Any] = {
+        "device": device,
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "mps_available": is_mps_available(),
+    }
+
+    if device == "cuda":
+        properties = torch.cuda.get_device_properties(0)
+        info.update({
+            "device_name": properties.name,
+            "vram_gb": round(properties.total_memory / 1024**3, 2),
+            "bf16_supported": torch.cuda.is_bf16_supported(),
+        })
+    elif device == "mps":
+        info["device_name"] = "Apple Silicon (MPS)"
+        info["bf16_supported"] = True
+    else:
+        info["device_name"] = "CPU"
+        info["bf16_supported"] = False
+
+    return info

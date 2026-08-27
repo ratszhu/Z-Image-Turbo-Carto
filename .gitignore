@@ -38,4 +38,12 @@ __pycache__/
 
 # 输出成果
 outputs/*
+loras/*
 
+# 本地生成历史（运行时数据，不应进入版本控制）
+database/history.db
+
+# 测试与覆盖率缓存
+.pytest_cache/
+.coverage
+htmlcov/

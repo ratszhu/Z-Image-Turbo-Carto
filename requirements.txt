@@ -1,23 +1,18 @@
-#1.基础依赖
-torch>=2.0.0
-torchvision
-torchaudio
-gradio>=4.0.0
-transformers
-accelerate
-protobuf
-sentencepiece
-huggingface_hub
-safetensors
+# 推理核心。PyTorch 的 CUDA wheel 请按 README 的硬件说明安装。
+torch>=2.5,<3
+transformers>=4.57,<5
+accelerate>=1.12,<2
+peft>=0.17,<0.21
+safetensors>=0.5,<1
+protobuf>=5,<7
+sentencepiece>=0.2,<1
+huggingface_hub>=0.36,<2
 
-#2.Diffusers 需要从 GitHub 源码安装以支持 Z-Image 的最新特性
+# 固定到已包含 ZImagePipeline/ZImageLoraLoaderMixin 的 Diffusers 提交，避免 main 漂移。
+diffusers @ git+https://github.com/huggingface/diffusers.git@82f175e05ad3019b86cdf97dae93dfa07139a8c0
 
-
-diffusers @ git+https://github.com/huggingface/diffusers.git
-
-#3. Web 服务库 (FastAPI 套件)
-fastapi
-uvicorn
-python-multipart
-aiofiles
-websockets
+# Web 服务
+fastapi>=0.123,<1
+pydantic>=2.12,<3
+uvicorn>=0.38,<1
+python-multipart>=0.0.20,<1
